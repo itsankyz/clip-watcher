@@ -450,19 +450,18 @@ Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
         f.write("\n".join(lines_out) + "\n")
 
 
-def burn_captions(ffmpeg, clip, srt, out, log_path, cam_h=768):
+def burn_captions(ffmpeg, clip, srt, out, log_path, cam_h=768, crf=23, preset="veryfast"):
     """Burn word-by-word ASS captions into the clip."""
     import tempfile as _tmp
     ass = _tmp.mktemp(suffix=".ass")
     try:
         srt_to_ass(srt, ass, video_width=1080, cam_h=cam_h)
-        # escape path for ffmpeg subtitles filter (Windows backslashes)
         ass_escaped = ass.replace("\\", "/").replace(":", "\\:")
         cmd = [
             ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
             "-i", clip,
             "-vf", f"subtitles='{ass_escaped}'",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+            "-c:v", "libx264", "-preset", preset, "-crf", str(crf),
             "-c:a", "copy",
             "-movflags", "+faststart",
             out,
@@ -610,17 +609,17 @@ def detect_cam(ffmpeg, ffprobe, src, duration, log_path):
 
 
 def ffmpeg_cut(ffmpeg, seek, src, out, duration, vf, log_path,
-               filter_complex=None):
+               filter_complex=None, crf=23, preset="veryfast"):
     cmd = [
         ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
         *seek, "-i", src, "-t", f"{duration:.3f}",
     ]
     if filter_complex:
-        cmd += ["-filter_complex", filter_complex, "-map", "[out]", "-map", "0:a?"]
+        cmd += ["-filter_complex", filter_complex, "-map", "[out]", "-map", "0:a:0?"]
     else:
         cmd += ["-vf", vf]
     cmd += [
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+        "-c:v", "libx264", "-preset", preset, "-crf", str(crf),
         "-c:a", "aac", "-b:a", "128k",
         "-movflags", "+faststart",
         out,
@@ -631,11 +630,52 @@ def ffmpeg_cut(ffmpeg, seek, src, out, duration, vf, log_path,
     return rc == 0 and os.path.exists(out) and os.path.getsize(out) > 0
 
 
+def _detect_device():
+    """Return 'cuda' if a CUDA GPU is available, else 'cpu'."""
+    try:
+        import torch
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:
+        return "cpu"
+
+
+def _cleanup_rec(rec_dir, keep_bytes=2 * 1024 ** 3):
+    """Delete oldest .ts files in rec_dir until total size <= keep_bytes."""
+    try:
+        files = [
+            os.path.join(rec_dir, f)
+            for f in os.listdir(rec_dir)
+            if f.endswith(".ts")
+        ]
+        files.sort(key=lambda p: os.path.getmtime(p))
+        total = sum(os.path.getsize(p) for p in files)
+        for path in files:
+            if total <= keep_bytes:
+                break
+            try:
+                size = os.path.getsize(path)
+                os.remove(path)
+                total -= size
+                log(f"[rec] deleted old recording {os.path.basename(path)} "
+                    f"(freed {size // 1024 // 1024} MB)")
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
 def transcribe(whisper, clip, args):
+    device = _detect_device()
     cmd = [whisper, clip, "--model", args.model,
+           "--device", device,
+           "--word_timestamps", "True",
            "--output_format", "srt", "--output_dir", args.clips_dir]
     if args.language:
         cmd += ["--language", args.language]
+    if device == "cuda":
+        log(f"[whisper] using GPU (CUDA)")
+    else:
+        log(f"[whisper] using CPU")
     log_path = os.path.join(args.log_dir, "whisper.log")
     with open(log_path, "ab") as logf:
         rc = subprocess.call(cmd, stdout=logf, stderr=subprocess.STDOUT,
@@ -652,7 +692,8 @@ def transcribe(whisper, clip, args):
         cam_h = int(args.height * 0.40) // 2 * 2
         burned = clip.replace(".mp4", "-cap.mp4")
         ffmpeg_log = os.path.join(args.log_dir, "ffmpeg.log")
-        ok = burn_captions(args.ffmpeg, clip, srt, burned, ffmpeg_log, cam_h=cam_h)
+        ok = burn_captions(args.ffmpeg, clip, srt, burned, ffmpeg_log,
+                            cam_h=cam_h, crf=args.crf, preset=args.preset)
         if ok:
             with contextlib.suppress(OSError):
                 os.replace(burned, clip)
@@ -772,14 +813,16 @@ class Clipper(threading.Thread):
                 layout_filter = build_facecam_filter(rect, args.aspect, args.height)
         ok = ffmpeg_cut(args.ffmpeg, ["-sseof", f"-{duration}"],
                         job["path"], out, duration, vf, ffmpeg_log,
-                        filter_complex=layout_filter)
+                        filter_complex=layout_filter,
+                        crf=args.crf, preset=args.preset)
         if not ok:
             total = probe_duration(args.ffprobe, job["path"])
             start = max(0.0, total - duration)
             if total > 0:
                 ok = ffmpeg_cut(args.ffmpeg, ["-ss", f"{start:.3f}"],
                                 job["path"], out, duration, vf, ffmpeg_log,
-                                filter_complex=layout_filter)
+                                filter_complex=layout_filter,
+                                crf=args.crf, preset=args.preset)
         if not ok:
             log(f"[clip] ffmpeg failed (see {ffmpeg_log})")
             with contextlib.suppress(OSError):
@@ -790,6 +833,7 @@ class Clipper(threading.Thread):
             f"median {job['median']:.1f})")
         with self.lock:
             self.made += 1
+        _cleanup_rec(args.rec_dir, keep_bytes=args.rec_keep_gb * 1024 ** 3)
         if args.whisper and not args.no_whisper:
             self.transcriber.submit(out)
     def _cam_rect(self, path, duration):
@@ -1031,6 +1075,14 @@ def build_parser():
                    help="whisper model: tiny/base/small/medium/large (default base)")
     p.add_argument("--language", default="",
                    help="force whisper language, e.g. en (default auto-detect)")
+    p.add_argument("--crf", type=int, default=23,
+                   help="ffmpeg CRF quality (lower = better, default 23)")
+    p.add_argument("--preset", default="veryfast",
+                   choices=["ultrafast","superfast","veryfast","faster",
+                             "fast","medium","slow","slower","veryslow"],
+                   help="ffmpeg encoding preset (default veryfast)")
+    p.add_argument("--rec-keep-gb", type=float, default=2.0,
+                   help="max GB to keep in rec/ before deleting oldest files (default 2)")
     p.add_argument("--no-whisper", action="store_true",
                    help="skip subtitle generation")
     p.add_argument("--rec-dir", default="rec", help="recording directory (default rec)")
