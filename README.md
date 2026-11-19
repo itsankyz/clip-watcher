@@ -179,4 +179,4 @@ logs/    streamlink.log  ffmpeg.log  whisper.log
 
 ## 📄 License
 
-[CC BY-NC 4.0](LICENSE) © 2025 Ankur Yadav — free to use and modify, **no commercial use**.
+[CC BY-NC 4.0](LICENSE) © 2026 Ankur Yadav — free to use and modify, **no commercial use**.
