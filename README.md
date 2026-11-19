@@ -48,7 +48,7 @@ Double-click **`watch-gui.cmd`** — no terminal needed.
 
 | Layout | Description |
 |--------|-------------|
-| 🎭 **Facecam + gameplay** | Streamer face top 40%, full game bottom 60%, auto face-detect |
+| 🎭 **Facecam + gameplay** | Enlarged facecam top 40%, full game bottom 60%, subtle divider |
 | ✂️ **9:16 center crop** | Plain vertical crop of the middle of the stream |
 
 ---
@@ -191,6 +191,7 @@ logs/    streamlink.log  ffmpeg.log  whisper.log
 - Chat retry limits apply to errors; YouTube offline/not-live checks continue retrying
 - Set `CLIP_WATCHER_DISCORD_WEBHOOK` instead of storing a webhook URL in a config file
 - Facecam falls back to 9:16 crop if no face is detected — use `--cam tl|tr|bl|br` to fix a corner
+- Facecam auto-detection prefers corner faces so it is less likely to crop a character in the gameplay
 - Whisper automatically uses CUDA when available, otherwise CPU; word-level timestamps drive caption highlighting
 
 ---

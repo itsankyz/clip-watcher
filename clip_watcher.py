@@ -29,6 +29,8 @@ import urllib.request
 IRC_HOST = "irc.chat.twitch.tv"
 IRC_PORT = 6667
 CHAT_STABLE_SECONDS = 30
+CAM_CORNER_MARGIN = 0.35
+CAM_DIVIDER_PX = 4
 PLATFORM_TWITCH = "twitch"
 PLATFORM_YOUTUBE = "youtube"
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
@@ -545,6 +547,7 @@ def build_facecam_filter(rect, aspect="9:16", height=1920):
     width = int(round(height * aw / ah / 2)) * 2
     cam_h  = int(height * 0.40) // 2 * 2   # 768 px at 1920
     game_h = height - cam_h                 # 1152 px at 1920
+    divider_y = cam_h - CAM_DIVIDER_PX // 2
     x, y, cw, ch = rect
     return (
         "[0:v]split=2[f][g];"
@@ -556,7 +559,9 @@ def build_facecam_filter(rect, aspect="9:16", height=1920):
         f"[g]scale={width}:{game_h}:force_original_aspect_ratio=increase,"
         f"crop={width}:{game_h},"
         f"unsharp=lx=3:ly=3:la=0.8:cx=3:cy=3:ca=0.4,setsar=1[gp];"
-        "[fc][gp]vstack=inputs=2,setsar=1,format=yuv420p[out]"
+        "[fc][gp]vstack=inputs=2,"
+        f"drawbox=x=0:y={divider_y}:w={width}:h={CAM_DIVIDER_PX}:"
+        "color=black@0.65:t=fill,setsar=1,format=yuv420p[out]"
     )
 
 
@@ -583,6 +588,23 @@ def manual_cam_rect(corner, width, height):
     x = 0 if corner in ("tl", "bl") else width - cw
     y = 0 if corner in ("tl", "tr") else height - ch
     return x, y, cw, ch
+
+
+def _face_is_in_corner(x, y, face_width, face_height, frame_width, frame_height):
+    center_x = x + face_width / 2
+    center_y = y + face_height / 2
+    return (
+        min(center_x, frame_width - center_x) <= frame_width * CAM_CORNER_MARGIN
+        and min(center_y, frame_height - center_y) <= frame_height * CAM_CORNER_MARGIN
+    )
+
+
+def _best_facecam_candidate(candidates):
+    corner_candidates = [
+        candidate for candidate in candidates
+        if _face_is_in_corner(*candidate[1:5], *candidate[5:7])
+    ]
+    return max(corner_candidates or candidates, key=lambda candidate: candidate[0], default=None)
 
 
 def _ensure_cam_model():
@@ -615,7 +637,7 @@ def detect_cam(ffmpeg, ffprobe, src, duration, log_path):
     if not width or not height:
         return None
     detector = cv2.FaceDetectorYN_create(CAM_MODEL, "", (640, 360), 0.6, 0.3, 5000)
-    best = None
+    candidates = []
     with tempfile.TemporaryDirectory(prefix="clipcam-") as tmp:
         pattern = os.path.join(tmp, "f%02d.jpg")
         cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
@@ -636,9 +658,9 @@ def detect_cam(ffmpeg, ffprobe, src, duration, log_path):
             for face in faces:
                 fx, fy, fw, fh = face[:4]
                 area = fw * fh
-                if best is None or area > best[0]:
-                    best = (area, fx, fy, fw, fh, sw, sh)
+                candidates.append((area, fx, fy, fw, fh, sw, sh))
 
+    best = _best_facecam_candidate(candidates)
     if best is None:
         log("[clip] facecam: no face found, using 9:16 crop "
             "(set the camera corner manually if this keeps happening)")
