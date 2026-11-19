@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Desktop front-end for clip-watcher."""
+"""Desktop front-end for clip-watcher.
+
+Copyright (c) 2025 Ankur Yadav.
+Licensed under CC BY-NC 4.0; see LICENSE.
+"""
 
 import hashlib
 import os
@@ -20,6 +24,9 @@ CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
 QUALITIES = ["best", "1080p60", "720p60", "480p30", "360p30", "worst"]
 MODELS    = ["tiny", "base", "small", "medium", "large"]
+CAM_ZOOM_MIN = 0.7
+CAM_ZOOM_MAX = 1.5
+CAM_ZOOM_DEFAULT = 1.0
 
 # ── palette ────────────────────────────────────────────────────────────────
 BG        = "#f7f7f7"
@@ -45,6 +52,76 @@ LOG_COLORS = {
     "error":     "#ef4444",
     "warning":   "#f59e0b",
 }
+
+
+def _runtime_event(line):
+    if line.startswith("[rec] recording ->"):
+        return "recorder_state", "recording"
+    if line.startswith("[rec] streamlink exited") and "retrying" in line:
+        return "recorder_state", "retrying"
+    if line.startswith("[rec] could not start streamlink"):
+        return "recorder_state", "error"
+    if line.startswith(("[rec] stream ended", "[watch] stream ended")):
+        return "recorder_state", "ended"
+    if line.startswith("[chat] connected to") or line.startswith(
+            "[chat] YouTube: reading chat"):
+        return "chat_state", "connected"
+    if (line.startswith("[chat] pytchat not installed") or
+            line.startswith("[chat] retry limit")):
+        return "chat_state", "unavailable"
+    if line.startswith("[chat] YouTube: stream not live yet"):
+        return "chat_state", "waiting"
+    if line.startswith("[chat]") and any(
+            marker in line for marker in ("reconnecting in", "retrying in", "error:")):
+        return "chat_state", "retrying"
+    if line.startswith("[clip] SPIKE"):
+        return "clip_state", "queued"
+    if line.startswith("[clip] saved"):
+        return "clip_state", "saved"
+    if line.startswith(("[clip] ffmpeg failed", "[clip] error:")):
+        return "clip_state", "error"
+    if line.startswith("[clip] skipped"):
+        return "clip_state", "skipped"
+    if (line.startswith("[whisper] failed") or
+            "caption burn failed" in line):
+        return "clip_state", "subtitle_warning"
+    if line.startswith("[gui] read error:"):
+        return "recorder_state", "error"
+    return None
+
+
+def _runtime_status(recorder_state, chat_state, clip_state, stopping=False):
+    if recorder_state == "error":
+        return "Watcher error - see log", "error"
+    if clip_state == "error":
+        return "Clip failed - see log", "error"
+    if stopping:
+        return "Stopping - finishing queued clips", "warning"
+    if recorder_state == "retrying":
+        return "Stream interrupted - reconnecting", "warning"
+    if recorder_state == "ended":
+        return "Stream ended - finishing clips", "warning"
+    if clip_state == "queued":
+        return "Spike detected - clip queued", "active"
+    if clip_state == "skipped":
+        return "Clip skipped - see log", "warning"
+    if clip_state == "subtitle_warning":
+        return "Clip saved; subtitles failed - see log", "warning"
+    if clip_state == "saved":
+        return "Clip saved - recording continues", "active"
+    if recorder_state == "starting":
+        return "Starting stream and chat...", "active"
+    if recorder_state == "recording":
+        if chat_state == "unavailable":
+            return "Recording only - chat unavailable", "warning"
+        if chat_state == "retrying":
+            return "Recording - chat reconnecting", "warning"
+        if chat_state == "waiting":
+            return "Recording - waiting for YouTube chat", "warning"
+        if chat_state == "connected":
+            return "Recording - chat connected", "active"
+        return "Recording - connecting chat", "active"
+    return "Idle - enter a channel or URL", "idle"
 
 
 def _find_python():
@@ -126,6 +203,10 @@ class App:
         self.clip_paths = []
         self.clip_sig = None
         self.preview_image = None
+        self.recorder_state = "idle"
+        self.chat_state = "idle"
+        self.clip_state = None
+        self.stop_requested = False
 
         root.title("clip-watcher")
         root.geometry("860x720")
@@ -170,9 +251,11 @@ class App:
         self.dot.grid(row=0, column=1, sticky="w", padx=(0, 4))
         self._dot_id = self.dot.create_oval(1, 1, 9, 9, fill="#d1d5db", outline="")
 
-        self.status_lbl = _label(hdr, "Idle — enter a channel or URL",
+        self.status_lbl = _label(hdr, "Idle - enter a channel or URL",
                                  color=TXT_MUTED, font=FONT_SM)
         self.status_lbl.grid(row=0, column=2, sticky="w")
+        _btn(hdr, "About", self._show_about, width=8).grid(
+            row=0, column=3, padx=12, sticky="e")
 
         # ── channel input ──
         ch_card = _card(self.root)
@@ -230,6 +313,23 @@ class App:
                  lambda p: _dropdown(p, self.cam_var,
                                      ["auto", "top-left", "top-right",
                                       "bottom-left", "bottom-right"], width=12))
+
+        zoom_f = ctk.CTkFrame(opt_card, fg_color="transparent")
+        zoom_f.grid(row=2, column=2, sticky="w", padx=(12, 16), pady=10)
+        zoom_hdr = ctk.CTkFrame(zoom_f, fg_color="transparent")
+        zoom_hdr.pack(fill="x")
+        _label(zoom_hdr, "Face zoom", color=TXT_MUTED, font=FONT_SM).pack(side="left")
+        self.cam_zoom_value = _label(zoom_hdr, "1.0x",
+                                     color=TXT_MUTED, font=FONT_SM)
+        self.cam_zoom_value.pack(side="right")
+        self.cam_zoom_slider = ctk.CTkSlider(
+            zoom_f, from_=CAM_ZOOM_MIN, to=CAM_ZOOM_MAX, number_of_steps=8,
+            command=self._update_cam_zoom, width=160,
+            fg_color=BORDER, progress_color=ACCENT, button_color=ACCENT,
+            button_hover_color=ACCENT_HO,
+        )
+        self.cam_zoom_slider.set(CAM_ZOOM_DEFAULT)
+        self.cam_zoom_slider.pack(anchor="w", pady=(3, 0))
 
         # clips folder
         folder_f = ctk.CTkFrame(opt_card, fg_color="transparent")
@@ -334,10 +434,34 @@ class App:
 
     # ── helpers ─────────────────────────────────────────────────────────────
 
-    def _set_status(self, text, active=False):
-        self.status_lbl.configure(text=text)
-        color = ACCENT if active else "#d1d5db"
-        self.dot.itemconfig(self._dot_id, fill=color)
+    def _set_status(self, text, active=False, error=False, warning=False):
+        color = (
+            "#ef4444" if error else
+            "#d97706" if warning else
+            ACCENT if active else TXT_MUTED
+        )
+        self.status_lbl.configure(text=text, text_color=color)
+        dot_color = color if active or error or warning else "#d1d5db"
+        self.dot.itemconfig(self._dot_id, fill=dot_color)
+
+    def _refresh_runtime_status(self):
+        text, severity = _runtime_status(
+            self.recorder_state, self.chat_state, self.clip_state,
+            stopping=self.stop_requested)
+        self._set_status(
+            text, active=severity == "active",
+            warning=severity == "warning", error=severity == "error")
+
+    def _handle_watcher_log(self, line):
+        self._log(line)
+        event = _runtime_event(line)
+        if event:
+            attribute, value = event
+            setattr(self, attribute, value)
+            self._refresh_runtime_status()
+
+    def _update_cam_zoom(self, value):
+        self.cam_zoom_value.configure(text=f"{float(value):.1f}x")
 
     def _log(self, line):
         self.log_text.configure(state="normal")
@@ -494,7 +618,7 @@ class App:
             except queue.Empty:
                 break
             if kind == "log":
-                self._log(payload)
+                self._handle_watcher_log(payload)
             elif kind == "preview":
                 self._show_preview(*payload)
             else:
@@ -549,7 +673,8 @@ class App:
                "--stop-file", STOP_FILE]
         if self.layout_var.get().startswith("Facecam"):
             cmd += ["--layout", "facecam", "--cam",
-                    cams.get(self.cam_var.get(), "auto")]
+                    cams.get(self.cam_var.get(), "auto"),
+                    "--cam-zoom", f"{self.cam_zoom_slider.get():.1f}"]
         else:
             cmd += ["--layout", "crop"]
         if not self.subs_var.get():
@@ -565,10 +690,16 @@ class App:
                 stdin=subprocess.DEVNULL, text=True, bufsize=1,
                 creationflags=CREATE_NO_WINDOW)
         except OSError as exc:
+            self._log(f"[gui] cannot start watcher: {exc}")
+            self._set_status("Could not start watcher", error=True)
             messagebox.showerror("clip-watcher", f"Cannot start watcher:\n{exc}")
             return
 
-        self._set_status(f"Watching {channel}", active=True)
+        self.recorder_state = "starting"
+        self.chat_state = "connecting"
+        self.clip_state = None
+        self.stop_requested = False
+        self._refresh_runtime_status()
         self.start_btn.configure(state="disabled", fg_color="#e5e7eb",
                                  text_color=TXT_MUTED)
         self.stop_btn.configure(state="normal", text_color=TXT)
@@ -584,7 +715,8 @@ class App:
         except OSError as exc:
             self._log(f"[gui] could not write stop file: {exc}")
         self._log("[gui] stop requested — finishing current clip ...")
-        self._set_status("Stopping...", active=False)
+        self.stop_requested = True
+        self._refresh_runtime_status()
         self.stop_btn.configure(state="disabled")
         self.root.after(15000, lambda: self._force_kill(proc))
 
@@ -603,6 +735,7 @@ class App:
                 proc.kill()
         except Exception as exc:
             self._log(f"[gui] kill failed: {exc}")
+            self._set_status("Could not stop watcher - see log", error=True)
 
     def _exited(self, rc):
         self._log(f"[gui] watcher exited (code {rc})")
@@ -614,7 +747,15 @@ class App:
         if self.closing:
             self.root.destroy()
             return
-        self._set_status("Idle — enter a channel or URL", active=False)
+        self.recorder_state = "idle"
+        self.chat_state = "idle"
+        self.clip_state = None
+        self.stop_requested = False
+        if rc:
+            self._set_status(f"Watcher stopped with error (code {rc})",
+                             error=True)
+        else:
+            self._set_status("Stopped", active=False)
         self.start_btn.configure(state="normal", fg_color=ACCENT,
                                  text_color="#ffffff")
         self.stop_btn.configure(state="disabled", text_color=TXT_MUTED)
@@ -629,6 +770,17 @@ class App:
             self.root.after(16000, self._force_close)
         else:
             self.root.destroy()
+
+    def _show_about(self):
+        messagebox.showinfo(
+            "About Clip Watcher",
+            "Clip Watcher\n"
+            "Created by Ankur Yadav\n\n"
+            "Copyright (c) 2025 Ankur Yadav\n"
+            "Licensed under CC BY-NC 4.0.\n"
+            "https://creativecommons.org/licenses/by-nc/4.0/\n"
+            "https://github.com/itsankyz/clip-watcher",
+        )
 
     def _force_close(self):
         self._force_kill(self.proc)

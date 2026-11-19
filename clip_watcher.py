@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """clip-watcher: record a live Twitch or YouTube stream, watch its chat
 anonymously, auto-clip the moments where chat explodes (vertical 9:16)
-and subtitle them."""
+and subtitle them.
+
+Copyright (c) 2025 Ankur Yadav.
+Licensed under CC BY-NC 4.0; see LICENSE.
+"""
 
 from __future__ import annotations
 
@@ -29,9 +33,13 @@ import urllib.request
 IRC_HOST = "irc.chat.twitch.tv"
 IRC_PORT = 6667
 CHAT_STABLE_SECONDS = 30
+REC_CLEANUP_INTERVAL = 60
 CAM_CORNER_MARGIN = 0.35
 CAM_DIVIDER_PX = 4
 CAM_FACE_SCALE = 2.2
+CAM_ZOOM_MIN = 0.7
+CAM_ZOOM_MAX = 1.5
+CAM_ZOOM_DEFAULT = 1.0
 PLATFORM_TWITCH = "twitch"
 PLATFORM_YOUTUBE = "youtube"
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
@@ -155,6 +163,7 @@ class Recorder(threading.Thread):
         self.path = None
         self.lock = threading.Lock()
         self.ended = threading.Event()
+        self.failed = threading.Event()
 
     def segment(self):
         with self.lock:
@@ -204,9 +213,23 @@ class Recorder(threading.Thread):
                     )
                 except OSError as exc:
                     log(f"[rec] could not start streamlink: {exc}")
+                    with self.lock:
+                        self.path = None
+                    self.failed.set()
                     return
+                last_cleanup = time.monotonic()
                 while not self.stop.is_set() and self.proc.poll() is None:
                     self.stop.wait(1)
+                    if self.stop.is_set():
+                        break
+                    now = time.monotonic()
+                    if now - last_cleanup >= REC_CLEANUP_INTERVAL:
+                        _cleanup_rec(
+                            self.args.rec_dir,
+                            keep_bytes=self.args.rec_keep_gb * 1024 ** 3,
+                            exclude=path,
+                        )
+                        last_cleanup = now
                 rc = self.proc.poll()
             if self.stop.is_set():
                 self._terminate()
@@ -579,10 +602,10 @@ def probe_size(ffprobe, path):
         return 0, 0
 
 
-def manual_cam_rect(corner, width, height):
+def manual_cam_rect(corner, width, height, zoom=CAM_ZOOM_DEFAULT):
     if corner == "auto" or not width or not height:
         return None
-    cw = int(width * 0.38) // 2 * 2
+    cw = int(width * 0.38 / zoom) // 2 * 2
     ch = int(cw / CAM_ASPECT) // 2 * 2
     if ch > height:
         ch = height // 2 * 2
@@ -608,9 +631,10 @@ def _best_facecam_candidate(candidates):
     return max(corner_candidates or candidates, key=lambda candidate: candidate[0], default=None)
 
 
-def _facecam_rect_from_face(fx, fy, fw, fh, width, height):
+def _facecam_rect_from_face(fx, fy, fw, fh, width, height,
+                            face_scale=CAM_FACE_SCALE):
     cx, cy = fx + fw / 2, fy + fh / 2
-    box_h = min(float(height), fh * CAM_FACE_SCALE)
+    box_h = min(float(height), fh * face_scale)
     box_w = min(float(width), box_h * CAM_ASPECT)
     box_h = min(float(height), box_w / CAM_ASPECT)
     bw = int(box_w) // 2 * 2
@@ -636,7 +660,8 @@ def _ensure_cam_model():
         return False
 
 
-def detect_cam(ffmpeg, ffprobe, src, duration, log_path):
+def detect_cam(ffmpeg, ffprobe, src, duration, log_path,
+               face_scale=CAM_FACE_SCALE):
     if not _ensure_cam_model():
         return None
     try:
@@ -681,7 +706,8 @@ def detect_cam(ffmpeg, ffprobe, src, duration, log_path):
     _, fx, fy, fw, fh, sw, sh = best
     sx, sy = width / sw, height / sh
     fx, fy, fw, fh = fx * sx, fy * sy, fw * sx, fh * sy
-    x, y, bw, bh = _facecam_rect_from_face(fx, fy, fw, fh, width, height)
+    x, y, bw, bh = _facecam_rect_from_face(
+        fx, fy, fw, fh, width, height, face_scale=face_scale)
     log(f"[clip] facecam: face at {x},{y} {bw}x{bh} (source {width}x{height})")
     return x, y, bw, bh
 
@@ -901,7 +927,8 @@ class Clipper(threading.Thread):
             return
         late = time.time() - due
         if late > 5:
-            log(f"[clip] warning: cutting {late:.0f}s late, clip may be shifted")
+            log(f"[clip] warning: clipper is {late:.0f}s behind schedule; "
+                "adjusting seek to preserve the requested window")
 
         try:
             file_size = os.path.getsize(job["path"])
@@ -920,6 +947,7 @@ class Clipper(threading.Thread):
             n += 1
 
         duration = args.pre + args.post
+        seek_back = duration + args.latency + max(0.0, late)
         log(f"[clip] cutting {duration}s ({args.pre}s before + {args.post}s after) "
             f"-> {os.path.basename(out)}")
         ffmpeg_log = os.path.join(args.log_dir, "ffmpeg.log")
@@ -929,18 +957,26 @@ class Clipper(threading.Thread):
             rect = self._cam_rect(job["path"], duration)
             if rect:
                 layout_filter = build_facecam_filter(rect, args.aspect, args.height)
-        ok = ffmpeg_cut(args.ffmpeg, ["-sseof", f"-{duration}"],
+        ok = ffmpeg_cut(args.ffmpeg, ["-sseof", f"-{seek_back:.3f}"],
                         job["path"], out, duration, vf, ffmpeg_log,
                         filter_complex=layout_filter,
                         crf=args.crf, preset=args.preset)
+        if ok and not all(probe_size(args.ffprobe, out)):
+            log("[clip] ffmpeg output has no video stream; retrying with absolute seek")
+            ok = False
+            with contextlib.suppress(OSError):
+                os.remove(out)
         if not ok:
             total = probe_duration(args.ffprobe, job["path"])
-            start = max(0.0, total - duration)
+            start = max(0.0, total - seek_back)
             if total > 0:
                 ok = ffmpeg_cut(args.ffmpeg, ["-ss", f"{start:.3f}"],
                                 job["path"], out, duration, vf, ffmpeg_log,
                                 filter_complex=layout_filter,
                                 crf=args.crf, preset=args.preset)
+                if ok and not all(probe_size(args.ffprobe, out)):
+                    log("[clip] fallback output has no video stream")
+                    ok = False
         if not ok:
             log(f"[clip] ffmpeg failed (see {ffmpeg_log})")
             with contextlib.suppress(OSError):
@@ -960,11 +996,12 @@ class Clipper(threading.Thread):
         args = self.args
         if args.cam != "auto":
             width, height = probe_size(args.ffprobe, path)
-            return manual_cam_rect(args.cam, width, height)
+            return manual_cam_rect(args.cam, width, height, zoom=args.cam_zoom)
         if path in self.cam_cache:
             return self.cam_cache[path]
         rect = detect_cam(args.ffmpeg, args.ffprobe, path, duration,
-                          os.path.join(args.log_dir, "ffmpeg.log"))
+                          os.path.join(args.log_dir, "ffmpeg.log"),
+                          face_scale=CAM_FACE_SCALE / args.cam_zoom)
         if rect:
             self.cam_cache[path] = rect
         return rect
@@ -1092,6 +1129,9 @@ def run(args):
             if args.stop_file and os.path.exists(args.stop_file):
                 log("[watch] stop requested")
                 break
+            if recorder.failed.is_set():
+                log("[watch] recorder failed; stopping watcher")
+                break
             idx = int(time.time() // args.bucket)
             while current < idx:
                 bucket_start = current * args.bucket
@@ -1148,7 +1188,7 @@ def run(args):
         with clipper.lock:
             made = clipper.made
         log(f"[watch] done -- {made} clip(s) in {args.clips_dir}{os.sep}")
-    return 0
+    return 1 if recorder.failed.is_set() else 0
 
 
 def _non_negative_int(value):
@@ -1170,6 +1210,20 @@ def _non_negative_float(value):
         raise argparse.ArgumentTypeError("must be a non-negative number") from exc
     if not math.isfinite(number) or number < 0:
         raise argparse.ArgumentTypeError("must be a finite non-negative number")
+    return number
+
+
+def _cam_zoom_value(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(
+            f"must be a number from {CAM_ZOOM_MIN} to {CAM_ZOOM_MAX}"
+        ) from exc
+    if not math.isfinite(number) or not CAM_ZOOM_MIN <= number <= CAM_ZOOM_MAX:
+        raise argparse.ArgumentTypeError(
+            f"must be a number from {CAM_ZOOM_MIN} to {CAM_ZOOM_MAX}"
+        )
     return number
 
 
@@ -1297,6 +1351,9 @@ def build_parser():
                    default="auto",
                    help="facecam position: auto-detect or top/bottom left/right "
                         "(default auto)")
+    p.add_argument("--cam-zoom", type=_cam_zoom_value, default=CAM_ZOOM_DEFAULT,
+                   help=f"facecam zoom from {CAM_ZOOM_MIN} (wider) to "
+                        f"{CAM_ZOOM_MAX} (closer), default {CAM_ZOOM_DEFAULT}")
     p.add_argument("--height", type=int, default=1920,
                    help="output height in pixels, 0 to keep the source size (default 1920)")
     p.add_argument("--quality", default="best",
