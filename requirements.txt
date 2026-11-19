@@ -1,0 +1,4 @@
+streamlink
+openai-whisper
+opencv-python-headless
+pytchat
