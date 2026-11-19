@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """Desktop front-end for clip-watcher."""
 
+import hashlib
 import os
 import queue
 import subprocess
 import sys
+import tempfile
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox
+
+import customtkinter as ctk
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CORE = os.path.join(ROOT, "clip_watcher.py")
@@ -56,64 +60,58 @@ PYTHON = _find_python()
 # ── reusable widgets ────────────────────────────────────────────────────────
 
 def _card(parent, **kw):
-    return tk.Frame(parent, bg=SURFACE, highlightbackground=BORDER,
-                    highlightthickness=1, **kw)
+    return ctk.CTkFrame(parent, fg_color=SURFACE, border_color=BORDER,
+                        border_width=1, corner_radius=8, **kw)
 
 
 def _label(parent, text, font=FONT, color=TXT, **kw):
-    return tk.Label(parent, text=text, font=font, fg=color, bg=parent["bg"], **kw)
+    return ctk.CTkLabel(parent, text=text, font=font, text_color=color,
+                        fg_color="transparent", **kw)
 
 
 def _entry(parent, textvariable, width=None):
-    e = tk.Entry(parent, textvariable=textvariable, font=FONT,
-                 fg=TXT, bg=SURFACE, insertbackground=TXT,
-                 relief="flat", highlightbackground=BORDER,
-                 highlightthickness=1, highlightcolor=ACCENT)
+    e = ctk.CTkEntry(parent, textvariable=textvariable, font=FONT,
+                     text_color=TXT, fg_color=SURFACE, border_color=BORDER,
+                     border_width=1, corner_radius=6)
     if width:
-        e.config(width=width)
+        e.configure(width=width * 10)
     return e
 
 
 def _btn(parent, text, command, primary=False, width=None):
     bg = ACCENT if primary else SURFACE
     fg = "#ffffff" if primary else TXT
-    b = tk.Button(parent, text=text, command=command,
-                  font=FONT, fg=fg, bg=bg,
-                  activebackground=ACCENT_HO if primary else BORDER,
-                  activeforeground=fg,
-                  relief="flat", cursor="hand2",
-                  padx=16, pady=6,
-                  highlightthickness=0)
+    b = ctk.CTkButton(
+        parent, text=text, command=command, font=FONT,
+        text_color=fg, fg_color=bg,
+        hover_color=ACCENT_HO if primary else BORDER,
+        corner_radius=6, cursor="hand2",
+    )
     if width:
-        b.config(width=width)
+        b.configure(width=width * 10)
     return b
 
 
 def _dropdown(parent, variable, values, width=12):
-    var = variable
-    om = tk.OptionMenu(parent, var, *values)
-    om.config(font=FONT, fg=TXT, bg=SURFACE, activebackground=BORDER,
-              relief="flat", highlightthickness=1,
-              highlightbackground=BORDER, width=width,
-              indicatoron=True, cursor="hand2")
-    om["menu"].config(font=FONT, fg=TXT, bg=SURFACE,
-                      activebackground=ACCENT, activeforeground="#fff",
-                      relief="flat", bd=0)
-    return om
+    return ctk.CTkOptionMenu(
+        parent, variable=variable, values=values, width=width * 10,
+        font=FONT, text_color=TXT, fg_color=SURFACE,
+        button_color=ACCENT, button_hover_color=ACCENT_HO,
+        dropdown_fg_color=SURFACE, dropdown_text_color=TXT,
+        dropdown_hover_color=BORDER, corner_radius=6,
+    )
 
 
 def _spinbox(parent, variable, from_, to, increment=1, width=6):
-    s = tk.Spinbox(parent, textvariable=variable,
-                   from_=from_, to=to, increment=increment,
-                   font=FONT, fg=TXT, bg=SURFACE,
-                   relief="flat", highlightbackground=BORDER,
-                   highlightthickness=1, width=width,
-                   buttonbackground=BORDER, cursor="hand2")
-    return s
+    return ctk.CTkEntry(parent, textvariable=variable, font=FONT,
+                        text_color=TXT, fg_color=SURFACE,
+                        border_color=BORDER, border_width=1,
+                        corner_radius=6, width=width * 10,
+                        justify="center")
 
 
 def _sep(parent):
-    return tk.Frame(parent, bg=BORDER, height=1)
+    return ctk.CTkFrame(parent, fg_color=BORDER, height=1, corner_radius=0)
 
 
 # ── main app ────────────────────────────────────────────────────────────────
@@ -126,11 +124,12 @@ class App:
         self.messages = queue.Queue()
         self.clip_paths = []
         self.clip_sig = None
+        self.preview_image = None
 
         root.title("clip-watcher")
         root.geometry("860x720")
         root.minsize(700, 560)
-        root.configure(bg=BG)
+        root.configure(fg_color=BG)
         root.rowconfigure(3, weight=1)
         root.columnconfigure(0, weight=1)
 
@@ -157,8 +156,8 @@ class App:
         P = dict(padx=12, pady=6)
 
         # ── header ──
-        hdr = tk.Frame(self.root, bg=SURFACE,
-                       highlightbackground=BORDER, highlightthickness=1)
+        hdr = ctk.CTkFrame(self.root, fg_color=SURFACE,
+                           border_color=BORDER, border_width=1, corner_radius=0)
         hdr.grid(row=0, column=0, sticky="ew")
         hdr.columnconfigure(1, weight=1)
 
@@ -195,7 +194,7 @@ class App:
         opt_card.grid(row=2, column=0, sticky="ew", padx=12, pady=4)
 
         def _opt_col(col, label, widget_fn):
-            f = tk.Frame(opt_card, bg=SURFACE)
+            f = ctk.CTkFrame(opt_card, fg_color="transparent")
             f.grid(row=0, column=col, sticky="w", padx=(12, 16), pady=10)
             _label(f, label, color=TXT_MUTED, font=FONT_SM).pack(anchor="w")
             widget_fn(f).pack(anchor="w", pady=(3, 0))
@@ -211,13 +210,13 @@ class App:
                  lambda p: _dropdown(p, self.model_var, MODELS, width=10))
 
         # subtitles toggle
-        sub_f = tk.Frame(opt_card, bg=SURFACE)
+        sub_f = ctk.CTkFrame(opt_card, fg_color="transparent")
         sub_f.grid(row=0, column=4, sticky="w", padx=(12, 16), pady=10)
         _label(sub_f, "Subtitles", color=TXT_MUTED, font=FONT_SM).pack(anchor="w")
-        tk.Checkbutton(sub_f, variable=self.subs_var,
-                       bg=SURFACE, activebackground=SURFACE,
-                       fg=TXT, selectcolor=SURFACE,
-                       relief="flat", cursor="hand2").pack(anchor="w", pady=(3, 0))
+        ctk.CTkCheckBox(sub_f, text="", variable=self.subs_var,
+                        fg_color=ACCENT, hover_color=ACCENT_HO,
+                        border_color=BORDER, checkbox_width=20,
+                        checkbox_height=20).pack(anchor="w", pady=(3, 0))
 
         _sep(opt_card).grid(row=1, column=0, columnspan=6, sticky="ew",
                             padx=12, pady=0)
@@ -232,7 +231,7 @@ class App:
                                       "bottom-left", "bottom-right"], width=12))
 
         # clips folder
-        folder_f = tk.Frame(opt_card, bg=SURFACE)
+        folder_f = ctk.CTkFrame(opt_card, fg_color="transparent")
         folder_f.grid(row=2, column=0, columnspan=6, sticky="ew",
                       padx=12, pady=(4, 10))
         folder_f.columnconfigure(1, weight=1)
@@ -244,7 +243,7 @@ class App:
         _btn(folder_f, "Open folder", self._open_folder).grid(row=1, column=2)
 
         # ── action bar ──
-        act = tk.Frame(self.root, bg=BG)
+        act = ctk.CTkFrame(self.root, fg_color="transparent")
         act.grid(row=3, column=0, sticky="ew", padx=12, pady=(4, 8))
 
         self.start_btn = _btn(act, "▶  Start watching", self.start,
@@ -252,11 +251,11 @@ class App:
         self.start_btn.pack(side="left")
 
         self.stop_btn = _btn(act, "■  Stop", self.stop, width=10)
-        self.stop_btn.config(state="disabled", fg=TXT_MUTED)
+        self.stop_btn.configure(state="disabled", text_color=TXT_MUTED)
         self.stop_btn.pack(side="left", padx=(8, 0))
 
         # ── bottom pane: clips + log ──
-        pane = tk.Frame(self.root, bg=BG)
+        pane = ctk.CTkFrame(self.root, fg_color="transparent")
         pane.grid(row=4, column=0, sticky="nsew", padx=12, pady=(0, 12))
         pane.rowconfigure(0, weight=1)
         pane.columnconfigure(0, weight=1)
@@ -266,10 +265,10 @@ class App:
         # clips panel
         clips_card = _card(pane)
         clips_card.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
-        clips_card.rowconfigure(1, weight=1)
+        clips_card.rowconfigure(2, weight=1)
         clips_card.columnconfigure(0, weight=1)
 
-        clips_hdr = tk.Frame(clips_card, bg=SURFACE)
+        clips_hdr = ctk.CTkFrame(clips_card, fg_color="transparent")
         clips_hdr.grid(row=0, column=0, columnspan=2, sticky="ew",
                        padx=12, pady=(10, 4))
         self.clips_title = _label(clips_hdr, "Clips", font=("Segoe UI", 10, "bold"))
@@ -277,18 +276,27 @@ class App:
         _label(clips_hdr, "double-click to play",
                color=TXT_MUTED, font=FONT_SM).pack(side="left", padx=8)
 
+        self.preview_label = tk.Label(
+            clips_card, text="Select a clip to preview",
+            font=FONT_SM, fg=TXT_MUTED, bg=LOG_BG,
+            width=36, height=8, compound="center",
+        )
+        self.preview_label.grid(row=1, column=0, columnspan=2, sticky="ew",
+                               padx=12, pady=(0, 8))
+
         self.clip_list = tk.Listbox(
             clips_card, font=FONT_SM, fg=TXT, bg=SURFACE,
             selectbackground=ACCENT, selectforeground="#fff",
             relief="flat", highlightthickness=0,
             activestyle="none", borderwidth=0)
-        self.clip_list.grid(row=1, column=0, sticky="nsew", padx=(12, 0), pady=(0, 12))
+        self.clip_list.grid(row=2, column=0, sticky="nsew", padx=(12, 0), pady=(0, 12))
+        self.clip_list.bind("<<ListboxSelect>>", lambda _e: self._preview_selected())
         self.clip_list.bind("<Double-Button-1>", lambda _e: self._open_clip())
 
         sb = tk.Scrollbar(clips_card, orient="vertical",
                           command=self.clip_list.yview,
                           bg=BG, troughcolor=BG, relief="flat")
-        sb.grid(row=1, column=1, sticky="ns", pady=(0, 12), padx=(0, 4))
+        sb.grid(row=2, column=1, sticky="ns", pady=(0, 12), padx=(0, 4))
         self.clip_list.configure(yscrollcommand=sb.set)
 
         # log panel
@@ -297,7 +305,7 @@ class App:
         log_card.rowconfigure(1, weight=1)
         log_card.columnconfigure(0, weight=1)
 
-        log_hdr = tk.Frame(log_card, bg=SURFACE)
+        log_hdr = ctk.CTkFrame(log_card, fg_color="transparent")
         log_hdr.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 4))
         _label(log_hdr, "Log", font=("Segoe UI", 10, "bold")).pack(side="left")
 
@@ -322,7 +330,7 @@ class App:
     # ── helpers ─────────────────────────────────────────────────────────────
 
     def _set_status(self, text, active=False):
-        self.status_lbl.config(text=text)
+        self.status_lbl.configure(text=text)
         color = ACCENT if active else "#d1d5db"
         self.dot.itemconfig(self._dot_id, fill=color)
 
@@ -375,6 +383,82 @@ class App:
         if sel and sel[0] < len(self.clip_paths):
             self._open_path(self.clip_paths[sel[0]])
 
+    def _preview_selected(self):
+        selection = self.clip_list.curselection()
+        if not selection or selection[0] >= len(self.clip_paths):
+            return
+        path = self.clip_paths[selection[0]]
+        self.preview_label.config(text="Loading preview...", image="")
+        self.preview_image = None
+        threading.Thread(target=self._make_preview, args=(path,),
+                         daemon=True).start()
+
+    def _make_preview(self, path):
+        try:
+            stat = os.stat(path)
+            identity = (os.path.normcase(os.path.abspath(path)) +
+                        f":{stat.st_size}:{stat.st_mtime_ns}")
+            cache_name = hashlib.sha256(identity.encode("utf-8")).hexdigest() + ".png"
+            cache_dir = os.path.join(tempfile.gettempdir(), "clip-watcher-previews")
+            os.makedirs(cache_dir, exist_ok=True)
+            preview_path = os.path.join(cache_dir, cache_name)
+            if not os.path.isfile(preview_path):
+                last_error = None
+                temp_preview = f"{preview_path}.{threading.get_ident()}.tmp.png"
+                for seek in ("1", "0"):
+                    try:
+                        subprocess.run(
+                            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                             "-ss", seek, "-i", path, "-frames:v", "1",
+                             "-vf", "scale=320:180:force_original_aspect_ratio=decrease,"
+                                    "pad=320:180:(ow-iw)/2:(oh-ih)/2",
+                             "-f", "image2", temp_preview],
+                            check=True, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE, timeout=30,
+                            creationflags=CREATE_NO_WINDOW,
+                        )
+                        if (not os.path.isfile(temp_preview) or
+                                os.path.getsize(temp_preview) == 0):
+                            last_error = "ffmpeg produced an empty preview"
+                            if os.path.isfile(temp_preview):
+                                os.remove(temp_preview)
+                            continue
+                        os.replace(temp_preview, preview_path)
+                        break
+                    except subprocess.CalledProcessError as exc:
+                        last_error = (
+                            exc.stderr.decode("utf-8", errors="replace").strip()
+                            if exc.stderr else str(exc)
+                        )
+                        if os.path.isfile(temp_preview):
+                            os.remove(temp_preview)
+                if (not os.path.isfile(preview_path) or
+                        os.path.getsize(preview_path) == 0):
+                    raise RuntimeError(last_error or "ffmpeg could not create a preview")
+            self.messages.put(("preview", (path, preview_path, None)))
+        except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+            self.messages.put(("preview", (path, None, str(exc))))
+
+    def _show_preview(self, path, preview_path, error):
+        selection = self.clip_list.curselection()
+        if not selection or selection[0] >= len(self.clip_paths):
+            return
+        if self.clip_paths[selection[0]] != path:
+            return
+        if error:
+            self.preview_label.config(
+                image="", text=f"Preview unavailable\n{error[:140]}")
+            self.preview_image = None
+            return
+        try:
+            image = tk.PhotoImage(file=preview_path)
+        except tk.TclError as exc:
+            self.preview_label.config(text=f"Preview unavailable\n{exc}")
+            self.preview_image = None
+            return
+        self.preview_image = image
+        self.preview_label.config(image=image, text="")
+
     def _refresh_clips(self):
         folder = self._clips_dir()
         try:
@@ -389,10 +473,12 @@ class App:
             self.clip_sig = sig
             self.clip_paths = paths
             self.clip_list.delete(0, "end")
+            self.preview_label.config(text="Select a clip to preview", image="")
+            self.preview_image = None
             for i, p in enumerate(paths):
                 self.clip_list.insert("end", f"  {os.path.basename(p)}")
                 self.clip_list.itemconfig(i, bg=SURFACE if i % 2 == 0 else "#f9f9f9")
-            self.clips_title.config(
+            self.clips_title.configure(
                 text=f"Clips ({len(paths)})" if paths else "Clips")
         self.root.after(2000, self._refresh_clips)
 
@@ -404,6 +490,8 @@ class App:
                 break
             if kind == "log":
                 self._log(payload)
+            elif kind == "preview":
+                self._show_preview(*payload)
             else:
                 self._exited(payload)
         self.root.after(100, self._pump)
@@ -476,8 +564,9 @@ class App:
             return
 
         self._set_status(f"Watching {channel}", active=True)
-        self.start_btn.config(state="disabled", bg="#e5e7eb", fg=TXT_MUTED)
-        self.stop_btn.config(state="normal", fg=TXT)
+        self.start_btn.configure(state="disabled", fg_color="#e5e7eb",
+                                 text_color=TXT_MUTED)
+        self.stop_btn.configure(state="normal", text_color=TXT)
         threading.Thread(target=self._read, args=(self.proc,),
                          daemon=True).start()
 
@@ -491,7 +580,7 @@ class App:
             self._log(f"[gui] could not write stop file: {exc}")
         self._log("[gui] stop requested — finishing current clip ...")
         self._set_status("Stopping...", active=False)
-        self.stop_btn.config(state="disabled")
+        self.stop_btn.configure(state="disabled")
         self.root.after(15000, lambda: self._force_kill(proc))
 
     def stop(self):
@@ -521,8 +610,9 @@ class App:
             self.root.destroy()
             return
         self._set_status("Idle — enter a channel or URL", active=False)
-        self.start_btn.config(state="normal", bg=ACCENT, fg="#ffffff")
-        self.stop_btn.config(state="disabled", fg=TXT_MUTED)
+        self.start_btn.configure(state="normal", fg_color=ACCENT,
+                                 text_color="#ffffff")
+        self.stop_btn.configure(state="disabled", text_color=TXT_MUTED)
 
     def _on_close(self):
         if self.proc and self.proc.poll() is None:
@@ -541,8 +631,10 @@ class App:
 
 
 def main():
-    root = tk.Tk()
-    root.configure(bg=BG)
+    ctk.set_appearance_mode("Light")
+    ctk.set_default_color_theme("blue")
+    root = ctk.CTk()
+    root.configure(fg_color=BG)
     App(root)
     root.mainloop()
 

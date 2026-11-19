@@ -22,9 +22,13 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 
 IRC_HOST = "irc.chat.twitch.tv"
 IRC_PORT = 6667
+CHAT_STABLE_SECONDS = 30
 PLATFORM_TWITCH = "twitch"
 PLATFORM_YOUTUBE = "youtube"
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
@@ -236,6 +240,38 @@ class _ChatBase(threading.Thread):
             self.pending += 1
 
 
+def _extract_youtube_video_id(value):
+    if not isinstance(value, str) or not value:
+        return ""
+    parsed = urllib.parse.urlsplit(value)
+    candidates = urllib.parse.parse_qs(parsed.query).get("v", [])
+    for candidate in candidates:
+        if re.fullmatch(r"[A-Za-z0-9_-]{11}", candidate):
+            return candidate
+
+    segments = [urllib.parse.unquote(part) for part in parsed.path.split("/") if part]
+    if parsed.hostname and parsed.hostname.lower() in ("youtu.be", "www.youtu.be"):
+        if segments and re.fullmatch(r"[A-Za-z0-9_-]{11}", segments[0]):
+            return segments[0]
+    for index, segment in enumerate(segments[:-1]):
+        if segment.lower() in ("live", "embed", "shorts"):
+            candidate = segments[index + 1]
+            if re.fullmatch(r"[A-Za-z0-9_-]{11}", candidate):
+                return candidate
+    return ""
+
+
+def _chat_retries_exhausted(retries, max_retries):
+    return max_retries > 0 and retries >= max_retries
+
+
+def _next_chat_retry(retries, connected_at, now=None):
+    now = time.monotonic() if now is None else now
+    if connected_at is not None and now - connected_at >= CHAT_STABLE_SECONDS:
+        retries = 0
+    return retries + 1
+
+
 class TwitchChat(_ChatBase):
     def __init__(self, args, stop):
         super().__init__()
@@ -245,8 +281,10 @@ class TwitchChat(_ChatBase):
     def run(self):
         nick = f"justinfan{random.randint(10000, 99999)}"
         backoff = 3
+        retries = 0
         while not self.stop.is_set():
             sock = None
+            connected_at = None
             buf = b""  # reset buffer on every (re)connect
             try:
                 sock = socket.create_connection(
@@ -258,6 +296,7 @@ class TwitchChat(_ChatBase):
                 log(f"[chat] connected to #{self.args.login} as {nick}")
                 self.connected.set()
                 backoff = 3
+                connected_at = time.monotonic()
                 while not self.stop.is_set():
                     try:
                         data = sock.recv(8192)
@@ -274,6 +313,11 @@ class TwitchChat(_ChatBase):
                             self._inc()
             except Exception as exc:
                 if not self.stop.is_set():
+                    retries = _next_chat_retry(retries, connected_at)
+                    if _chat_retries_exhausted(retries, self.args.chat_max_retries):
+                        log(f"[chat] retry limit ({self.args.chat_max_retries}) reached; "
+                            "disabling Twitch chat")
+                        return
                     log(f"[chat] {exc} -- reconnecting in {backoff}s")
                     self.stop.wait(backoff)
                     backoff = min(backoff * 2, 30)
@@ -301,8 +345,10 @@ class YouTubeChat(_ChatBase):
             return
 
         backoff = 5
+        retries = 0
         while not self.stop.is_set():
             chat = None
+            connected_at = None
             try:
                 # pytchat needs a video ID; if we have a channel /live URL
                 # streamlink resolves it, but pytchat needs the actual video id.
@@ -317,12 +363,20 @@ class YouTubeChat(_ChatBase):
                 chat = pytchat.create(video_id=video_id, interruptable=False)
                 self.connected.set()
                 backoff = 5
+                connected_at = time.monotonic()
                 while not self.stop.is_set() and chat.is_alive():
                     for item in chat.get().sync_items():
                         self._inc()
                     self.stop.wait(1)
+                if not self.stop.is_set():
+                    raise ConnectionError("YouTube live chat disconnected")
             except Exception as exc:
                 if not self.stop.is_set():
+                    retries = _next_chat_retry(retries, connected_at)
+                    if _chat_retries_exhausted(retries, self.args.chat_max_retries):
+                        log(f"[chat] retry limit ({self.args.chat_max_retries}) reached; "
+                            "disabling YouTube chat")
+                        return
                     log(f"[chat] YouTube error: {exc} -- retrying in {backoff}s")
                     self.stop.wait(backoff)
                     backoff = min(backoff * 2, 60)
@@ -333,25 +387,44 @@ class YouTubeChat(_ChatBase):
                         chat.terminate()
 
     def _resolve_video_id(self):
-        """Return the live video ID. If the URL already contains one, use it directly."""
-        # Direct video URL already has the ID (watch?v= or /live/ID)
-        m = re.search(r"(?:watch\?v=|/live/)([A-Za-z0-9_-]{11})", self.args.url)
-        if m:
-            return m.group(1)
-        # Channel /live URL — ask streamlink to resolve the actual stream URL
+        """Resolve a YouTube live ID from the URL or available stream tools."""
+        video_id = _extract_youtube_video_id(self.args.url)
+        if video_id:
+            return video_id
+
         try:
             import json
             out = subprocess.check_output(
                 [self.args.streamlink, "--json", self.args.url, "best"],
                 stderr=subprocess.DEVNULL, timeout=30, text=True, **no_window())
             data = json.loads(out)
-            url = data.get("url", "")
-            m = re.search(r"[?&]v=([A-Za-z0-9_-]{11})", url)
-            if m:
-                return m.group(1)
-            return data.get("metadata", {}).get("id", "")
-        except Exception:
-            return ""
+            if isinstance(data, dict):
+                video_id = _extract_youtube_video_id(data.get("url", ""))
+                metadata = data.get("metadata")
+                metadata_id = metadata.get("id", "") if isinstance(metadata, dict) else ""
+            else:
+                metadata_id = ""
+            if not video_id:
+                if re.fullmatch(r"[A-Za-z0-9_-]{11}", metadata_id):
+                    video_id = metadata_id
+            if video_id:
+                return video_id
+        except (OSError, subprocess.SubprocessError, ValueError) as exc:
+            log(f"[chat] streamlink could not resolve YouTube live ID: {exc}")
+
+        yt_dlp = shutil.which("yt-dlp")
+        if yt_dlp:
+            try:
+                out = subprocess.check_output(
+                    [yt_dlp, "--get-id", "--no-warnings", "--no-playlist",
+                     "--skip-download", self.args.url],
+                    stderr=subprocess.DEVNULL, timeout=30, text=True, **no_window())
+                for candidate in out.splitlines():
+                    if re.fullmatch(r"[A-Za-z0-9_-]{11}", candidate.strip()):
+                        return candidate.strip()
+            except (OSError, subprocess.SubprocessError) as exc:
+                log(f"[chat] yt-dlp could not resolve YouTube live ID: {exc}")
+        return ""
 
 
 def srt_to_ass(srt_path, ass_path, video_width=1080, cam_h=768):
@@ -592,10 +665,11 @@ def ffmpeg_cut(ffmpeg, seek, src, out, duration, vf, log_path,
         *seek, "-i", src, "-t", f"{duration:.3f}",
     ]
     if filter_complex:
-        cmd += ["-filter_complex", filter_complex, "-map", "[out]", "-map", "0:a:0?"]
+        cmd += ["-filter_complex", filter_complex, "-map", "[out]"]
     else:
-        cmd += ["-vf", vf]
+        cmd += ["-vf", vf, "-map", "0:v:0"]
     cmd += [
+        "-map", "0:a:0?",
         "-c:v", "libx264", "-preset", preset, "-crf", str(crf),
         "-c:a", "aac", "-b:a", "128k",
         "-movflags", "+faststart",
@@ -695,6 +769,29 @@ def transcribe(whisper, clip, args):
             with contextlib.suppress(OSError):
                 os.remove(burned)
             log(f"[whisper] caption burn failed, keeping plain clip")
+
+
+def notify_clip(clip_path, webhook_url):
+    if not webhook_url:
+        return
+    import json
+
+    payload = json.dumps({
+        "content": f"New clip saved: {os.path.basename(clip_path)}"
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        webhook_url, data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            if not 200 <= response.status < 300:
+                raise urllib.error.URLError(f"unexpected HTTP status {response.status}")
+    except (OSError, urllib.error.URLError, ValueError) as exc:
+        log(f"[notify] Discord webhook failed: {exc}")
+        return
+    log(f"[notify] sent clip notification for {os.path.basename(clip_path)}")
 
 
 class Transcriber(threading.Thread):
@@ -826,6 +923,7 @@ class Clipper(threading.Thread):
             f"median {job['median']:.1f})")
         with self.lock:
             self.made += 1
+        notify_clip(out, args.discord_webhook_url)
         _cleanup_rec(args.rec_dir, keep_bytes=args.rec_keep_gb * 1024 ** 3,
                      exclude=job["path"])
         if args.whisper and not args.no_whisper:
@@ -1025,12 +1123,122 @@ def run(args):
     return 0
 
 
+def _non_negative_int(value):
+    if isinstance(value, bool):
+        raise argparse.ArgumentTypeError("must be a non-negative integer")
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("must be a non-negative integer") from exc
+    if number < 0 or isinstance(value, float) and not value.is_integer():
+        raise argparse.ArgumentTypeError("must be a non-negative integer")
+    return number
+
+
+def _non_negative_float(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("must be a non-negative number") from exc
+    if not math.isfinite(number) or number < 0:
+        raise argparse.ArgumentTypeError("must be a finite non-negative number")
+    return number
+
+
+def _crf_value(value):
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("must be an integer from 0 to 51") from exc
+    if isinstance(value, float) and not value.is_integer() or not 0 <= number <= 51:
+        raise argparse.ArgumentTypeError("must be an integer from 0 to 51")
+    return number
+
+
+def _read_toml_config(config_path, parser):
+    try:
+        import tomllib
+    except ImportError:
+        import tomli as tomllib
+
+    with open(config_path, "rb") as config_file:
+        data = tomllib.load(config_file)
+    if not isinstance(data, dict):
+        raise ValueError("the TOML document must contain a table")
+    if set(data) - {"watch", "notifications"}:
+        unknown = sorted(set(data) - {"watch", "notifications"})
+        raise ValueError(f"unknown config section(s): {', '.join(unknown)}")
+
+    actions = {
+        action.dest: action
+        for action in parser._actions
+        if action.option_strings
+    }
+    values = {}
+    watch_values = data.get("watch", {})
+    notifications = data.get("notifications", {})
+    if not isinstance(watch_values, dict) or not isinstance(notifications, dict):
+        raise ValueError("[watch] and [notifications] must be TOML tables")
+
+    for key, value in watch_values.items():
+        action = actions.get(key)
+        if action is None or key in ("config", "discord_webhook_url"):
+            raise ValueError(f"unknown [watch] option: {key}")
+        if action.type:
+            if isinstance(value, bool):
+                raise ValueError(f"invalid value for [watch].{key}: {value!r}")
+            try:
+                value = action.type(value)
+            except (TypeError, ValueError, argparse.ArgumentTypeError) as exc:
+                raise ValueError(f"invalid value for [watch].{key}: {value!r}") from exc
+        elif action.default in (True, False) and not isinstance(value, bool):
+            raise ValueError(f"[watch].{key} must be true or false")
+        if action.choices and value not in action.choices:
+            raise ValueError(
+                f"invalid [watch].{key}: {value!r}; expected one of {action.choices}"
+            )
+        values[key] = value
+
+    if set(notifications) - {"discord_webhook_url"}:
+        unknown = sorted(set(notifications) - {"discord_webhook_url"})
+        raise ValueError(f"unknown [notifications] option(s): {', '.join(unknown)}")
+    if "discord_webhook_url" in notifications:
+        url = notifications["discord_webhook_url"]
+        if not isinstance(url, str):
+            raise ValueError("[notifications].discord_webhook_url must be a string")
+        if url:
+            values["discord_webhook_url"] = url
+    return values
+
+
+def parse_args(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument("--config")
+    config_args, _ = config_parser.parse_known_args(argv)
+
+    parser = build_parser()
+    config_path = config_args.config
+    if config_path is None:
+        default_config = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "config.toml")
+        if os.path.isfile(default_config):
+            config_path = default_config
+    if config_path:
+        try:
+            parser.set_defaults(**_read_toml_config(config_path, parser))
+        except (OSError, ValueError) as exc:
+            parser.error(f"cannot load config {config_path!r}: {exc}")
+    return parser.parse_args(argv)
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         prog="watch.sh",
         description="Record a live Twitch or YouTube stream, watch chat anonymously and "
                     "auto-clip chat spikes to vertical video with subtitles.")
     p.add_argument("channel", help="twitch channel, twitch.tv URL, @YouTubeHandle, or youtube.com URL")
+    p.add_argument("--config", help="TOML settings file (defaults to config.toml if present)")
     p.add_argument("--min", dest="min_msgs", type=int, default=10,
                    help="messages per bucket required for a spike (default 10; "
                         "quiet chats: --min 5)")
@@ -1069,14 +1277,19 @@ def build_parser():
                    help="whisper model: tiny/base/small/medium/large (default base)")
     p.add_argument("--language", default="",
                    help="force whisper language, e.g. en (default auto-detect)")
-    p.add_argument("--crf", type=int, default=23,
-                   help="ffmpeg CRF quality (lower = better, default 23)")
+    p.add_argument("--crf", type=_crf_value, default=23,
+                   help="ffmpeg CRF quality from 0 to 51 (lower = better, default 23)")
     p.add_argument("--preset", default="veryfast",
                    choices=["ultrafast","superfast","veryfast","faster",
                              "fast","medium","slow","slower","veryslow"],
                    help="ffmpeg encoding preset (default veryfast)")
-    p.add_argument("--rec-keep-gb", type=float, default=2.0,
+    p.add_argument("--rec-keep-gb", type=_non_negative_float, default=2.0,
                    help="max GB to keep in rec/ before deleting oldest files (default 2)")
+    p.add_argument("--chat-max-retries", type=_non_negative_int, default=10,
+                   help="maximum consecutive chat connection retries, 0 = unlimited (default 10)")
+    p.add_argument("--discord-webhook-url",
+                   default=os.environ.get("CLIP_WATCHER_DISCORD_WEBHOOK", ""),
+                   help="Discord webhook for new-clip notifications")
     p.add_argument("--no-whisper", action="store_true",
                    help="skip subtitle generation")
     p.add_argument("--rec-dir", default="rec", help="recording directory (default rec)")
@@ -1099,7 +1312,7 @@ def build_parser():
 
 
 def main(argv=None):
-    args = build_parser().parse_args(argv)
+    args = parse_args(argv)
     args = prepare(args)
     return run(args)
 

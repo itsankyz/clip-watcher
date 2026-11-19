@@ -41,6 +41,7 @@ Double-click **`watch-gui.cmd`** — no terminal needed.
 - Enter a Twitch channel name, `@YouTubeHandle`, or full stream URL
 - Pick your layout, quality, and Whisper model
 - Press **Start watching** — clips appear in the list as they are made
+- Select a clip to preview a frame; double-click it to play
 - Press **Stop** to finish the current clip and exit cleanly
 
 **Clip layouts:**
@@ -59,7 +60,7 @@ Requires **Python 3.9+** and **ffmpeg**.
 **Windows** (PowerShell):
 ```powershell
 python -m venv .venv
-.venv\Scripts\python -m pip install streamlink openai-whisper opencv-python-headless pytchat
+.venv\Scripts\python -m pip install -r requirements.txt
 winget install Gyan.FFmpeg
 watch.cmd xqc
 ```
@@ -67,7 +68,7 @@ watch.cmd xqc
 **Linux / macOS / WSL**:
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install streamlink openai-whisper opencv-python-headless pytchat
+.venv/bin/pip install -r requirements.txt
 sudo apt install ffmpeg        # macOS: brew install ffmpeg
 chmod +x watch.sh
 ./watch.sh xqc
@@ -75,6 +76,12 @@ chmod +x watch.sh
 
 > The first clip downloads the Whisper model (~150 MB for `base`).
 > The YuNet face-detection model is downloaded automatically on first facecam use.
+
+### Optional settings
+
+Copy `config.example.toml` to `config.toml` for reusable settings. `config.toml`
+is ignored by Git; command-line options override its values. `requirements.txt`
+installs `tomli` automatically on Python 3.9 and 3.10.
 
 ---
 
@@ -99,6 +106,7 @@ chmod +x watch.sh
 
 | Flag | Default | Description |
 |------|---------|-------------|
+| `--config PATH` | `config.toml` if present | load reusable settings from a TOML file |
 | `--min N` | `10` | messages per bucket needed to call it a spike |
 | `--mult X` | `2.5` | spike must be this many × the recent median |
 | `--bucket N` | `10` | bucket size in seconds |
@@ -115,9 +123,11 @@ chmod +x watch.sh
 | `--quality Q` | `best` | streamlink quality: `best` `720p60` `480p` |
 | `--model M` | `base` | whisper model: `tiny` `base` `small` `medium` `large` |
 | `--language XX` | auto | force whisper language e.g. `en` |
-| `--crf N` | `23` | video quality: lower values give larger, higher-quality files |
+| `--crf N` | `23` | video quality (0–51): lower values give larger, higher-quality files |
 | `--preset P` | `veryfast` | x264 speed/size tradeoff: `ultrafast` through `veryslow` |
 | `--rec-keep-gb N` | `2` | maximum space for completed recordings; oldest files are removed first |
+| `--chat-max-retries N` | `10` | stop after N consecutive chat connection errors; `0` = unlimited |
+| `--discord-webhook-url URL` | off | send the clip filename to a Discord webhook |
 | `--no-whisper` | off | skip subtitle generation |
 | `--max-clips N` | `0` | stop after N clips, `0` = never stop |
 | `--verbose` | off | log every chat bucket |
@@ -174,9 +184,12 @@ logs/    streamlink.log  ffmpeg.log  whisper.log
 
 - Only works while the channel is **live** — retries every 20 s while offline
 - **YouTube** chat needs `pip install pytchat` — without it the tool still clips but won't detect spikes automatically
+- YouTube channel live IDs are resolved with Streamlink, with optional `yt-dlp` fallback when installed
 - Twitch ads are skipped automatically via `--twitch-disable-ads` if streamlink supports it
 - If clips feel **early** raise `--latency`; if **late** lower it
 - Recording cleanup runs after a clip is saved; the active recording is never deleted
+- Chat retry limits apply to errors; YouTube offline/not-live checks continue retrying
+- Set `CLIP_WATCHER_DISCORD_WEBHOOK` instead of storing a webhook URL in a config file
 - Facecam falls back to 9:16 crop if no face is detected — use `--cam tl|tr|bl|br` to fix a corner
 - Whisper automatically uses CUDA when available, otherwise CPU; word-level timestamps drive caption highlighting
 
