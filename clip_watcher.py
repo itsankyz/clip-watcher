@@ -31,6 +31,7 @@ IRC_PORT = 6667
 CHAT_STABLE_SECONDS = 30
 CAM_CORNER_MARGIN = 0.35
 CAM_DIVIDER_PX = 4
+CAM_FACE_SCALE = 2.2
 PLATFORM_TWITCH = "twitch"
 PLATFORM_YOUTUBE = "youtube"
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
@@ -607,6 +608,18 @@ def _best_facecam_candidate(candidates):
     return max(corner_candidates or candidates, key=lambda candidate: candidate[0], default=None)
 
 
+def _facecam_rect_from_face(fx, fy, fw, fh, width, height):
+    cx, cy = fx + fw / 2, fy + fh / 2
+    box_h = min(float(height), fh * CAM_FACE_SCALE)
+    box_w = min(float(width), box_h * CAM_ASPECT)
+    box_h = min(float(height), box_w / CAM_ASPECT)
+    bw = int(box_w) // 2 * 2
+    bh = int(box_h) // 2 * 2
+    x = int(min(max(0.0, cx - box_w / 2), width - bw))
+    y = int(min(max(0.0, cy - fh * 0.9), height - bh))
+    return x, y, bw, bh
+
+
 def _ensure_cam_model():
     """Download the YuNet face-detection model if it is not present."""
     if os.path.exists(CAM_MODEL):
@@ -668,14 +681,7 @@ def detect_cam(ffmpeg, ffprobe, src, duration, log_path):
     _, fx, fy, fw, fh, sw, sh = best
     sx, sy = width / sw, height / sh
     fx, fy, fw, fh = fx * sx, fy * sy, fw * sx, fh * sy
-    cx, cy = fx + fw / 2, fy + fh / 2
-    box_h = min(float(height), fh * 3.0)
-    box_w = min(float(width), box_h * CAM_ASPECT)
-    box_h = min(float(height), box_w / CAM_ASPECT)
-    bw = int(box_w) // 2 * 2
-    bh = int(box_h) // 2 * 2
-    x = int(min(max(0.0, cx - box_w / 2), width - bw))
-    y = int(min(max(0.0, cy - fh * 0.9), height - bh))
+    x, y, bw, bh = _facecam_rect_from_face(fx, fy, fw, fh, width, height)
     log(f"[clip] facecam: face at {x},{y} {bw}x{bh} (source {width}x{height})")
     return x, y, bw, bh
 
