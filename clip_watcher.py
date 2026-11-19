@@ -355,10 +355,7 @@ class YouTubeChat(_ChatBase):
 
 
 def srt_to_ass(srt_path, ass_path, video_width=1080, cam_h=768):
-    """Convert .srt to .ass with word-by-word karaoke highlight.
-    Active word gets a purple box; all text is large bold white with black outline.
-    Captions sit at the boundary between cam and game (cam_h position).
-    """
+    """Convert Whisper's word-highlighted SRT to ASS with timed word emphasis."""
     import re as _re
 
     def ts_to_cs(ts):
@@ -387,8 +384,7 @@ def srt_to_ass(srt_path, ass_path, video_width=1080, cam_h=768):
             continue
         start_cs = ts_to_cs(m.group(1))
         end_cs   = ts_to_cs(m.group(2))
-        text = " ".join(lines[2:] if lines[0].isdigit() else lines[1:])
-        text = _re.sub(r"<[^>]+>", "", text).strip()
+        text = " ".join(lines[2:] if lines[0].isdigit() else lines[1:]).strip()
         if text:
             blocks.append((start_cs, end_cs, text))
 
@@ -410,40 +406,21 @@ Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
 
     lines_out = []
     for start_cs, end_cs, text in blocks:
-        words = text.split()
-        if not words:
+        active_word = _re.search(r"<u>(.*?)</u>", text, flags=_re.IGNORECASE)
+        if active_word:
+            text = _re.sub(
+                r"<u>(.*?)</u>",
+                r"{\\1c&H00FFFFFF&\\3c&HFF0080&\\bord4\\shad0}\1{\\rDefault}",
+                text,
+                flags=_re.IGNORECASE,
+            )
+        text = _re.sub(r"<[^>]+>", "", text).strip()
+        if not text:
             continue
-        duration_cs = max(1, end_cs - start_cs)
-        word_cs = duration_cs // len(words)
-        # build karaoke line: {\k<cs>} per word, active word gets purple highlight
-        kar = ""
-        for i, w in enumerate(words):
-            # \k = karaoke fill timing in centiseconds
-            # \1c = primary colour (white), \3c = outline (black)
-            # highlight box via \shad0\bord0\1c&H00FFFFFF\4c&H800080 on active
-            kar += f"{{\\k{word_cs}}}{w} "
-        kar = kar.strip()
-        # simpler reliable approach: one dialogue line per word with exact timing
-        t = start_cs
-        for w in words:
-            ws = t
-            we = min(t + word_cs, end_cs)
-            # build full line: non-active words normal, active word in purple box
-            line_parts = []
-            for j, ww in enumerate(words):
-                if ww == w and ws == t:
-                    # active word: white text, purple background box
-                    line_parts.append(
-                        f"{{\\1c&H00FFFFFF&\\3c&H000000&\\4c&HFF0080&\\bord3\\shad0}}{ww}"
-                    )
-                else:
-                    line_parts.append(
-                        f"{{\\1c&H00FFFFFF&\\3c&H000000&\\bord3\\shad0}}{ww}"
-                    )
-            dialogue = "Dialogue: 0," + cs_to_ass(ws) + "," + cs_to_ass(we) + \
-                       ",Default,,0,0,0,," + " ".join(line_parts)
-            lines_out.append(dialogue)
-            t += word_cs
+        lines_out.append(
+            "Dialogue: 0," + cs_to_ass(start_cs) + "," + cs_to_ass(end_cs) +
+            ",Default,,0,0,0,," + text
+        )
 
     with open(ass_path, "w", encoding="utf-8") as f:
         f.write(ass_header)
@@ -639,29 +616,44 @@ def _detect_device():
         return "cpu"
 
 
-def _cleanup_rec(rec_dir, keep_bytes=2 * 1024 ** 3):
-    """Delete oldest .ts files in rec_dir until total size <= keep_bytes."""
+def _cleanup_rec(rec_dir, keep_bytes=2 * 1024 ** 3, exclude=None):
+    """Delete oldest completed .ts files while preserving the active recording."""
+    excluded = (
+        os.path.normcase(os.path.abspath(exclude))
+        if exclude is not None else None
+    )
     try:
-        files = [
-            os.path.join(rec_dir, f)
-            for f in os.listdir(rec_dir)
-            if f.endswith(".ts")
-        ]
-        files.sort(key=lambda p: os.path.getmtime(p))
-        total = sum(os.path.getsize(p) for p in files)
-        for path in files:
-            if total <= keep_bytes:
-                break
-            try:
-                size = os.path.getsize(path)
-                os.remove(path)
-                total -= size
-                log(f"[rec] deleted old recording {os.path.basename(path)} "
-                    f"(freed {size // 1024 // 1024} MB)")
-            except OSError:
-                pass
-    except OSError:
-        pass
+        names = os.listdir(rec_dir)
+    except OSError as exc:
+        log(f"[rec] could not list recordings in {rec_dir}: {exc}")
+        return
+
+    files = []
+    for name in names:
+        path = os.path.join(rec_dir, name)
+        if not name.lower().endswith(".ts") or os.path.normcase(os.path.abspath(path)) == excluded:
+            continue
+        try:
+            stat = os.stat(path)
+        except OSError as exc:
+            log(f"[rec] could not inspect {path}: {exc}")
+            continue
+        if os.path.isfile(path):
+            files.append((path, stat.st_mtime, stat.st_size))
+
+    files.sort(key=lambda item: item[1])
+    total = sum(size for _, _, size in files)
+    for path, _, size in files:
+        if total <= keep_bytes:
+            break
+        try:
+            os.remove(path)
+        except OSError as exc:
+            log(f"[rec] could not delete old recording {path}: {exc}")
+            continue
+        total -= size
+        log(f"[rec] deleted old recording {os.path.basename(path)} "
+            f"(freed {size // 1024 // 1024} MB)")
 
 
 def transcribe(whisper, clip, args):
@@ -669,6 +661,7 @@ def transcribe(whisper, clip, args):
     cmd = [whisper, clip, "--model", args.model,
            "--device", device,
            "--word_timestamps", "True",
+           "--highlight_words", "True",
            "--output_format", "srt", "--output_dir", args.clips_dir]
     if args.language:
         cmd += ["--language", args.language]
@@ -833,7 +826,8 @@ class Clipper(threading.Thread):
             f"median {job['median']:.1f})")
         with self.lock:
             self.made += 1
-        _cleanup_rec(args.rec_dir, keep_bytes=args.rec_keep_gb * 1024 ** 3)
+        _cleanup_rec(args.rec_dir, keep_bytes=args.rec_keep_gb * 1024 ** 3,
+                     exclude=job["path"])
         if args.whisper and not args.no_whisper:
             self.transcriber.submit(out)
     def _cam_rect(self, path, duration):

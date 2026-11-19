@@ -90,6 +90,7 @@ chmod +x watch.sh
 ./watch.sh sodapoppin --layout facecam           # face on top, gameplay below
 ./watch.sh sodapoppin --layout facecam --cam bl  # camera fixed bottom-left
 ./watch.sh sodapoppin --quality 720p60 --model small --language en
+./watch.sh sodapoppin --crf 20 --preset fast      # higher-quality encoding
 ```
 
 ---
@@ -114,6 +115,9 @@ chmod +x watch.sh
 | `--quality Q` | `best` | streamlink quality: `best` `720p60` `480p` |
 | `--model M` | `base` | whisper model: `tiny` `base` `small` `medium` `large` |
 | `--language XX` | auto | force whisper language e.g. `en` |
+| `--crf N` | `23` | video quality: lower values give larger, higher-quality files |
+| `--preset P` | `veryfast` | x264 speed/size tradeoff: `ultrafast` through `veryslow` |
+| `--rec-keep-gb N` | `2` | maximum space for completed recordings; oldest files are removed first |
 | `--no-whisper` | off | skip subtitle generation |
 | `--max-clips N` | `0` | stop after N clips, `0` = never stop |
 | `--verbose` | off | log every chat bucket |
@@ -159,7 +163,7 @@ SpikeDetector              ffmpeg cuts clip
 ## 📁 Output
 
 ```
-rec/     raw recordings  (~2–4 GB/hr at 1080p — delete old ones)
+rec/     raw recordings  (~2–4 GB/hr at 1080p — oldest completed files are cleaned up)
 clips/   clip-<channel>-<timestamp>.mp4  +  .srt
 logs/    streamlink.log  ffmpeg.log  whisper.log
 ```
@@ -172,8 +176,9 @@ logs/    streamlink.log  ffmpeg.log  whisper.log
 - **YouTube** chat needs `pip install pytchat` — without it the tool still clips but won't detect spikes automatically
 - Twitch ads are skipped automatically via `--twitch-disable-ads` if streamlink supports it
 - If clips feel **early** raise `--latency`; if **late** lower it
+- Recording cleanup runs after a clip is saved; the active recording is never deleted
 - Facecam falls back to 9:16 crop if no face is detected — use `--cam tl|tr|bl|br` to fix a corner
-- Whisper `tiny`/`base` are CPU-friendly; `small` and up are faster with a GPU
+- Whisper automatically uses CUDA when available, otherwise CPU; word-level timestamps drive caption highlighting
 
 ---
 
