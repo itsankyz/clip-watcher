@@ -24,7 +24,7 @@ MODELS    = ["tiny", "base", "small", "medium", "large"]
 # ── palette ────────────────────────────────────────────────────────────────
 BG        = "#f7f7f7"
 SURFACE   = "#ffffff"
-BORDER    = "#e2e2e2"
+BORDER    = "#cbd5e1"
 ACCENT    = "#f97316"
 ACCENT_HO = "#ea6c0a"
 TXT       = "#1a1a1a"
@@ -85,6 +85,7 @@ def _btn(parent, text, command, primary=False, width=None):
         parent, text=text, command=command, font=FONT,
         text_color=fg, fg_color=bg,
         hover_color=ACCENT_HO if primary else BORDER,
+        border_width=0 if primary else 1, border_color=BORDER,
         corner_radius=6, cursor="hand2",
     )
     if width:
@@ -193,20 +194,20 @@ class App:
         opt_card = _card(self.root)
         opt_card.grid(row=2, column=0, sticky="ew", padx=12, pady=4)
 
-        def _opt_col(col, label, widget_fn):
+        def _opt_col(row, col, label, widget_fn):
             f = ctk.CTkFrame(opt_card, fg_color="transparent")
-            f.grid(row=0, column=col, sticky="w", padx=(12, 16), pady=10)
+            f.grid(row=row, column=col, sticky="w", padx=(12, 16), pady=10)
             _label(f, label, color=TXT_MUTED, font=FONT_SM).pack(anchor="w")
             widget_fn(f).pack(anchor="w", pady=(3, 0))
 
-        _opt_col(0, "Min msgs / 10 s",
+        _opt_col(0, 0, "Min msgs / 10 s",
                  lambda p: _spinbox(p, self.min_var, 1, 999, width=7))
-        _opt_col(1, "Spike multiplier",
+        _opt_col(0, 1, "Spike multiplier",
                  lambda p: _spinbox(p, self.mult_var, 1.0, 10.0,
                                     increment=0.5, width=7))
-        _opt_col(2, "Quality",
+        _opt_col(0, 2, "Quality",
                  lambda p: _dropdown(p, self.quality_var, QUALITIES, width=10))
-        _opt_col(3, "Whisper model",
+        _opt_col(0, 3, "Whisper model",
                  lambda p: _dropdown(p, self.model_var, MODELS, width=10))
 
         # subtitles toggle
@@ -221,18 +222,18 @@ class App:
         _sep(opt_card).grid(row=1, column=0, columnspan=6, sticky="ew",
                             padx=12, pady=0)
 
-        _opt_col(0, "Clip layout",
+        _opt_col(2, 0, "Clip layout",
                  lambda p: _dropdown(p, self.layout_var,
                                      ["Facecam + gameplay", "9:16 center crop"],
                                      width=18))
-        _opt_col(1, "Camera corner",
+        _opt_col(2, 1, "Camera corner",
                  lambda p: _dropdown(p, self.cam_var,
                                      ["auto", "top-left", "top-right",
                                       "bottom-left", "bottom-right"], width=12))
 
         # clips folder
         folder_f = ctk.CTkFrame(opt_card, fg_color="transparent")
-        folder_f.grid(row=2, column=0, columnspan=6, sticky="ew",
+        folder_f.grid(row=3, column=0, columnspan=6, sticky="ew",
                       padx=12, pady=(4, 10))
         folder_f.columnconfigure(1, weight=1)
         _label(folder_f, "Clips folder", color=TXT_MUTED,
@@ -280,6 +281,8 @@ class App:
             clips_card, text="Select a clip to preview",
             font=FONT_SM, fg=TXT_MUTED, bg=LOG_BG,
             width=36, height=8, compound="center",
+            highlightthickness=1, highlightbackground=BORDER,
+            highlightcolor=ACCENT,
         )
         self.preview_label.grid(row=1, column=0, columnspan=2, sticky="ew",
                                padx=12, pady=(0, 8))
@@ -287,7 +290,8 @@ class App:
         self.clip_list = tk.Listbox(
             clips_card, font=FONT_SM, fg=TXT, bg=SURFACE,
             selectbackground=ACCENT, selectforeground="#fff",
-            relief="flat", highlightthickness=0,
+            relief="flat", highlightthickness=1,
+            highlightbackground=BORDER, highlightcolor=ACCENT,
             activestyle="none", borderwidth=0)
         self.clip_list.grid(row=2, column=0, sticky="nsew", padx=(12, 0), pady=(0, 12))
         self.clip_list.bind("<<ListboxSelect>>", lambda _e: self._preview_selected())
@@ -311,7 +315,8 @@ class App:
 
         self.log_text = tk.Text(
             log_card, font=FONT_MONO, fg=TXT, bg=LOG_BG,
-            relief="flat", highlightthickness=0,
+            relief="flat", highlightthickness=1,
+            highlightbackground=BORDER, highlightcolor=ACCENT,
             state="disabled", wrap="word", borderwidth=0)
         self.log_text.grid(row=1, column=0, sticky="nsew",
                            padx=(12, 0), pady=(0, 12))
